@@ -496,29 +496,42 @@ def save_comparison_overlay(data, mask_v1, mask_v2, centroid, frame_name, out_pa
     other. A green dashed line marks the (possibly manually-corrected)
     valve-plane cut, when provided, so you can see directly where v2's base
     cutoff sits.
+
+    Either mask may be None (--method sphere / conical); only the masks
+    that were computed are drawn.
     """
     cx, cy, cz = centroid
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    title_bits = "red = v1, cyan dashed = v2"
+    legend = []
+    if mask_v1 is not None:
+        legend.append("red = v1")
+    if mask_v2 is not None:
+        legend.append("cyan dashed = v2")
     if valve_plane_idx is not None:
-        title_bits += ", green = valve plane"
-    fig.suptitle(f"{frame_name}   ({title_bits})", fontsize=11)
+        legend.append("green = valve plane")
+    fig.suptitle(f"{frame_name}   ({', '.join(legend)})", fontsize=11)
 
+    def slices(m):
+        if m is None:
+            return [None, None, None]
+        return [m[:, :, cz].T, m[:, cy, :].T, m[cx, :, :].T]
+
+    s1, s2 = slices(mask_v1), slices(mask_v2)
     panels = [
-        (axes[0], data[:, :, cz].T, mask_v1[:, :, cz].T, mask_v2[:, :, cz].T, f"Axial z={cz}"),
-        (axes[1], data[:, cy, :].T, mask_v1[:, cy, :].T, mask_v2[:, cy, :].T, f"Coronal y={cy}"),
-        (axes[2], data[cx, :, :].T, mask_v1[cx, :, :].T, mask_v2[cx, :, :].T, f"Sagittal x={cx}"),
+        (axes[0], data[:, :, cz].T, s1[0], s2[0], f"Axial z={cz}"),
+        (axes[1], data[:, cy, :].T, s1[1], s2[1], f"Coronal y={cy}"),
+        (axes[2], data[cx, :, :].T, s1[2], s2[2], f"Sagittal x={cx}"),
     ]
 
     for panel_idx, (ax, slc, m1, m2, title) in enumerate(panels):
-        m1 = m1.astype(bool)
-        m2 = m2.astype(bool)
         ax.imshow(slc, cmap="gray", origin="lower", vmin=vmin, vmax=vmax)
 
-        if m1.sum() > 0:
-            ax.contour(m1, levels=[0.5], colors=["red"], linewidths=1.2, linestyles="solid")
-        if m2.sum() > 0:
-            ax.contour(m2, levels=[0.5], colors=["cyan"], linewidths=1.2, linestyles="dashed")
+        if m1 is not None and m1.any():
+            ax.contour(m1.astype(bool), levels=[0.5], colors=["red"],
+                       linewidths=1.2, linestyles="solid")
+        if m2 is not None and m2.any():
+            ax.contour(m2.astype(bool), levels=[0.5], colors=["cyan"],
+                       linewidths=1.2, linestyles="dashed")
 
         # axis==1 ("y") is drawn as a horizontal line in the axial panel
         # (index 0) and a vertical line in the sagittal panel (index 2) —
@@ -537,9 +550,18 @@ def save_comparison_overlay(data, mask_v1, mask_v2, centroid, frame_name, out_pa
     plt.close()
 
 
-def save_comparison_plot(results, out_path):
-    """Volume-over-time: v1 vs v2 on the same axes, folders concatenated
-    sequentially (same convention as extract_lv_volume.save_volume_plot)."""
+def _overlay_centroid(data, mask_v1, mask_v2):
+    """Slice position for the QC overlay: centroid of v2, else v1, else volume center."""
+    for m in (mask_v2, mask_v1):
+        if m is not None and m.any():
+            return tuple(int(round(c)) for c in ndimage.center_of_mass(m))
+    return tuple(s // 2 for s in data.shape)
+
+
+def save_comparison_plot(results, out_path, methods=("v1", "v2")):
+    """Volume-over-time for the methods that were run (v1 and/or v2) on the
+    same axes, folders concatenated sequentially (same convention as
+    extract_lv_volume.save_volume_plot)."""
     fig, ax = plt.subplots(figsize=(10, 5))
 
     folders = []
@@ -548,31 +570,37 @@ def save_comparison_plot(results, out_path):
             folders.append(r["folder"])
 
     frames, v1_vals, v2_vals, boundaries = [], [], [], []
-    offset = 0
     for folder in folders:
         subset = [r for r in results if r["folder"] == folder]
-        f = [offset + r["frame_idx"] for r in subset]
+        f = [r["phase_pct"] for r in subset]
         frames += f
-        v1_vals += [r["volume_ml_v1"] for r in subset]
-        v2_vals += [r["volume_ml_v2"] for r in subset]
-        boundaries.append((offset, folder))
-        offset = max(f) + 1
+        v1_vals += [r.get("volume_ml_v1") for r in subset]
+        v2_vals += [r.get("volume_ml_v2") for r in subset]
+        boundaries.append((min(f), folder))
 
-    ax.plot(frames, v1_vals, "o--", color="tab:red",
-            label="v1: sphere + threshold + directional extend")
-    ax.plot(frames, v2_vals, "o-", color="tab:cyan",
-            label="v2: conical + valve-plane + cone-gated extend")
+    plotted = []
+    if "v1" in methods:
+        ax.plot(frames, v1_vals, "o--", color="tab:red",
+                label="v1: sphere + threshold + directional extend")
+        plotted += v1_vals
+    if "v2" in methods:
+        ax.plot(frames, v2_vals, "o-", color="tab:cyan",
+                label="v2: conical + valve-plane + cone-gated extend")
+        plotted += v2_vals
 
     for x, _ in boundaries[1:]:
-        ax.axvline(x - 0.5, color="gray", linestyle=":", linewidth=1)
-    ymax = max(v1_vals + v2_vals)
+        ax.axvline(x - 2.5, color="gray", linestyle=":", linewidth=1)
+    ymax = max(plotted)
     for x, folder in boundaries:
         ax.annotate(folder, (x, ymax), textcoords="offset points",
                     xytext=(2, 4), fontsize=8, color="gray")
 
-    ax.set_xlabel("Sequential frame index")
+    ax.set_xlabel("Cardiac phase (% R-R)")
     ax.set_ylabel("LV cavity volume (mL)")
-    ax.set_title("LV Volume Over Time: v1 vs v2 Segmentation")
+    if len(methods) == 2:
+        ax.set_title("LV Volume Over Time: v1 vs v2 Segmentation")
+    else:
+        ax.set_title(f"LV Volume Over Time: {methods[0]} Segmentation")
     ax.legend()
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -581,21 +609,30 @@ def save_comparison_plot(results, out_path):
     print(f"Comparison volume plot saved: {out_path}")
 
 
-def save_comparison_csv(results, out_path):
+def save_comparison_csv(results, out_path, methods=("v1", "v2")):
+    """One row per frame; columns only for the methods that were run."""
+    both = len(methods) == 2
+    cols = ["phase_pct", "folder", "frame_idx", "filename"]
+    cols += [f"volume_ml_{m}" for m in methods]
+    if both:
+        cols.append("diff_ml")
+    cols += [f"voxel_count_{m}" for m in methods]
+    if "v2" in methods:
+        cols += ["valve_plane_auto", "valve_plane_final", "manually_corrected"]
+
     with open(out_path, "w") as f:
-        f.write("folder,frame_idx,filename,volume_ml_v1,volume_ml_v2,diff_ml,"
-                "voxel_count_v1,voxel_count_v2,valve_plane_auto,valve_plane_final,"
-                "manually_corrected\n")
+        f.write(",".join(cols) + "\n")
         for r in results:
-            diff = r["volume_ml_v2"] - r["volume_ml_v1"]
-            corrected = r["valve_plane_final"] != r["valve_plane_auto"]
-            f.write(
-                f"{r['folder']},{r['frame_idx']},{r['filename']},"
-                f"{r['volume_ml_v1']:.4f},{r['volume_ml_v2']:.4f},{diff:+.4f},"
-                f"{r['voxel_count_v1']},{r['voxel_count_v2']},"
-                f"{r['valve_plane_auto']},{r['valve_plane_final']},{corrected}\n"
-            )
-    print(f"Comparison CSV saved: {out_path}")
+            row = [f"{r['phase_pct']:g}", r["folder"], r["frame_idx"], r["filename"]]
+            row += [f"{r[f'volume_ml_{m}']:.4f}" for m in methods]
+            if both:
+                row.append(f"{r['volume_ml_v2'] - r['volume_ml_v1']:+.4f}")
+            row += [r[f"voxel_count_{m}"] for m in methods]
+            if "v2" in methods:
+                corrected = r["valve_plane_final"] != r["valve_plane_auto"]
+                row += [r["valve_plane_auto"], r["valve_plane_final"], corrected]
+            f.write(",".join(str(v) for v in row) + "\n")
+    print(f"Volume CSV saved: {out_path}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -609,6 +646,10 @@ def main():
         epilog=__doc__,
     )
     parser.add_argument("--folders", nargs="+", default=["retro_A_frames", "retro_B_frames"])
+    parser.add_argument("--method", choices=["sphere", "conical", "both"], default="both",
+                         help="Which segmentation to run: 'sphere' (v1), 'conical' (v2), "
+                              "or 'both' for the head-to-head comparison (~2x slower). "
+                              "Default: both")
     parser.add_argument("--seed", type=int, nargs=3, metavar=("X", "Y", "Z"),
                          help="Seed voxel coordinate inside the LV cavity (skip interactive selection)")
     parser.add_argument("--threshold", type=float, default=None,
@@ -638,6 +679,13 @@ def main():
                               "can drag-correct it. Requires a display; opens once per "
                               "frame (~20x for a full retro_A+retro_B run). Only the "
                               "--axis 1 (default) line overlay is drawn.")
+    parser.add_argument("--phases", type=float, nargs="+", default=None, metavar="PCT",
+                         help="Only segment these cardiac phases, in percent of the "
+                              "R-R interval, e.g. --phases 0 40 for a quick QC check. "
+                              "Assumes the files across all --folders (in order) are "
+                              "evenly spaced over 0-100%% (20 files -> 0, 5, ..., 95%%). "
+                              "Seed and threshold still come from the first phase. "
+                              "Temporal smoothing is skipped (phases aren't contiguous).")
     parser.add_argument("--output", default="results_conical",
                          help="Output directory (default: results_conical)")
     args = parser.parse_args()
@@ -673,25 +721,72 @@ def main():
         threshold = estimate_threshold(first_data, seed)
         print(f"Auto-detected threshold: {threshold:.0f} HU")
 
-    # ── Pass 1: segment every frame with BOTH v1 and v2 ────────────────
-    all_data, v1_raw, v2_raw, valve_indices, meta = [], [], [], [], []
+    del first_data  # free memory; each phase is loaded again in the loop
+
+    run_v1 = args.method in ("sphere", "both")
+    run_v2 = args.method in ("conical", "both")
+    methods = tuple(m for m, on in (("v1", run_v1), ("v2", run_v2)) if on)
+    print(f"Segmentation method(s): {', '.join(methods)}")
+
+    # Cardiac phase (% R-R) of each file, assuming even spacing over the cycle
+    phase_step = 100.0 / len(frames)
+    phase_pct = [i * phase_step for i in range(len(frames))]
+
+    if args.phases is not None:
+        selected = []
+        for p in args.phases:
+            i = int(round(p / phase_step))
+            if not (0 <= i < len(frames)) or abs(i * phase_step - p) > 1e-6:
+                print(f"ERROR: phase {p:g}% not available. Phases: "
+                      + ", ".join(f"{q:g}" for q in phase_pct))
+                return
+            selected.append(i)
+        frames = [frames[i] for i in selected]
+        phase_pct = [phase_pct[i] for i in selected]
+        print("Only segmenting selected phase(s): "
+              + ", ".join(f"{p:g}% = {fo}/{os.path.basename(fp)}"
+                          for p, (fo, fp) in zip(phase_pct, frames)))
+
+    smoothing = args.temporal_window > 0 and args.phases is None
+    if args.temporal_window > 0 and not smoothing:
+        print("Temporal smoothing skipped (--phases selects non-contiguous phases).")
+
+    # Per-phase outputs written as soon as each phase finishes, so you can
+    # inspect the segmentation while the run is still going. These use the
+    # UNSMOOTHED masks; if temporal smoothing is on, the final smoothed
+    # overlays/CSV in qc_overlays/ and volumes_comparison.csv come at the end.
+    live_dir = os.path.join(args.output, "qc_overlays_live") if smoothing else qc_dir
+    os.makedirs(live_dir, exist_ok=True)
+    live_csv = os.path.join(args.output, "volumes_live.csv")
+    with open(live_csv, "w") as f:
+        f.write(",".join(["phase_pct", "folder", "frame_idx", "filename"]
+                         + [f"volume_ml_{m}" for m in methods]
+                         + (["valve_plane"] if run_v2 else [])) + "\n")
+    print(f"Per-phase overlays -> {live_dir}/   per-phase volumes -> {live_csv}")
+
+    # ── Pass 1: segment every phase with the selected method(s) ────────
+    v1_raw, v2_raw, valve_indices, meta = [], [], [], []
     shared_affine = shared_voxel_vol = None
 
-    for i, (folder_name, filepath) in enumerate(frames):
+    for i, ((folder_name, filepath), pct) in enumerate(zip(frames, phase_pct)):
         filename = os.path.basename(filepath)
         frame_idx = int(filename.split("frame_")[1].split(".")[0])
-        print(f"\n[{i + 1}/{len(frames)}] {folder_name}/{filename}")
+        print(f"\n[{i + 1}/{len(frames)}] phase {pct:g}%  ({folder_name}/{filename})")
 
         data, affine, voxel_sizes, voxel_vol = load_nifti(filepath)
         if shared_affine is None:
             shared_affine, shared_voxel_vol = affine, voxel_vol
 
-        mask_v1, _ = segment_lv_cavity(
-            data, seed, voxel_sizes, threshold=threshold,
-            sphere_radius_mm=args.sphere_radius,
-        )
+        mask_v1 = mask_v2 = auto_idx = final_idx = None
+        if run_v1:
+            mask_v1, _ = segment_lv_cavity(
+                data, seed, voxel_sizes, threshold=threshold,
+                sphere_radius_mm=args.sphere_radius,
+            )
 
-        if args.manual_review:
+        if not run_v2:
+            pass
+        elif args.manual_review:
             # MANUAL CORRECTION STEP: detect automatically first, then let
             # the user confirm/drag-correct before the cone is built.
             auto_idx, snapped_seed = auto_detect_valve_plane(
@@ -723,69 +818,94 @@ def main():
             )
             auto_idx = final_idx  # no manual review -> auto value is final
 
-        v1_vol = compute_volume_ml(mask_v1, voxel_vol)
-        v2_vol = compute_volume_ml(mask_v2, voxel_vol)
-        print(f"  v1: {v1_vol:.2f} mL  |  v2: {v2_vol:.2f} mL  (diff {v2_vol - v1_vol:+.2f} mL)")
+        line = []
+        if run_v1:
+            v1_vol = compute_volume_ml(mask_v1, voxel_vol)
+            line.append(f"v1: {v1_vol:.2f} mL")
+        if run_v2:
+            v2_vol = compute_volume_ml(mask_v2, voxel_vol)
+            line.append(f"v2: {v2_vol:.2f} mL")
+        if run_v1 and run_v2:
+            line.append(f"(diff {v2_vol - v1_vol:+.2f} mL)")
+        print("  " + "  |  ".join(line))
 
-        all_data.append(data)
+        # Live outputs for this phase (unsmoothed)
+        overlay_path = os.path.join(
+            live_dir, f"phase_{pct:04.1f}pct_{folder_name}_frame_{frame_idx:02d}_overlay.png")
+        save_comparison_overlay(data, mask_v1, mask_v2,
+                                 _overlay_centroid(data, mask_v1, mask_v2),
+                                 f"phase {pct:g}% — {filename}",
+                                 overlay_path, axis=args.axis, valve_plane_idx=final_idx)
+        with open(live_csv, "a") as f:
+            row = [f"{pct:g}", folder_name, frame_idx, filename]
+            row += [f"{compute_volume_ml(m, voxel_vol):.4f}"
+                    for m in (mask_v1, mask_v2) if m is not None]
+            if run_v2:
+                row.append(final_idx)
+            f.write(",".join(str(v) for v in row) + "\n")
+        print(f"  overlay saved: {overlay_path}")
+
+        del data  # keep only the (much smaller) masks in memory
         v1_raw.append(mask_v1)
         v2_raw.append(mask_v2)
         valve_indices.append((auto_idx, final_idx))
-        meta.append((folder_name, frame_idx, filename))
+        meta.append((folder_name, frame_idx, filename, filepath, pct))
 
-    # ── Pass 2: temporal smoothing, applied identically to both ────────
-    if args.temporal_window > 0:
+    # ── Pass 2: temporal smoothing, applied identically to each method ──
+    v1_masks, v2_masks = v1_raw, v2_raw
+    if smoothing:
         print(f"\nTemporal smoothing (window={args.temporal_window})...")
-        v1_masks = temporal_smooth_masks(v1_raw, window=args.temporal_window)
-        v2_masks = temporal_smooth_masks(v2_raw, window=args.temporal_window)
-    else:
-        v1_masks, v2_masks = v1_raw, v2_raw
+        if run_v1:
+            v1_masks = temporal_smooth_masks(v1_raw, window=args.temporal_window)
+        if run_v2:
+            v2_masks = temporal_smooth_masks(v2_raw, window=args.temporal_window)
 
-    # ── Pass 3: final volumes, overlays, comparison outputs ─────────────
+    # ── Pass 3: final volumes, overlays, outputs ────────────────────────
     results = []
-    for (folder_name, frame_idx, filename), data, m1, m2, (auto_idx, final_idx) in zip(
-        meta, all_data, v1_masks, v2_masks, valve_indices
+    for (folder_name, frame_idx, filename, filepath, pct), m1, m2, (auto_idx, final_idx) in zip(
+        meta, v1_masks, v2_masks, valve_indices
     ):
-        v1_vol = compute_volume_ml(m1, shared_voxel_vol)
-        v2_vol = compute_volume_ml(m2, shared_voxel_vol)
+        r = {"phase_pct": pct, "folder": folder_name, "frame_idx": frame_idx, "filename": filename,
+             "valve_plane_auto": auto_idx, "valve_plane_final": final_idx}
+        if run_v1:
+            r["volume_ml_v1"] = compute_volume_ml(m1, shared_voxel_vol)
+            r["voxel_count_v1"] = int(m1.sum())
+        if run_v2:
+            r["volume_ml_v2"] = compute_volume_ml(m2, shared_voxel_vol)
+            r["voxel_count_v2"] = int(m2.sum())
+        results.append(r)
 
-        if m2.sum() > 0:
-            centroid = tuple(int(round(c)) for c in ndimage.center_of_mass(m2))
-        elif m1.sum() > 0:
-            centroid = tuple(int(round(c)) for c in ndimage.center_of_mass(m1))
-        else:
-            centroid = (data.shape[0] // 2, data.shape[1] // 2, data.shape[2] // 2)
+        # Without smoothing, the live overlays already show these final masks.
+        if smoothing:
+            data = load_nifti(filepath)[0]
+            overlay_name = f"phase_{pct:04.1f}pct_{folder_name}_frame_{frame_idx:02d}_overlay.png"
+            save_comparison_overlay(data, m1, m2, _overlay_centroid(data, m1, m2),
+                                     f"phase {pct:g}% — {filename} (smoothed)",
+                                     os.path.join(qc_dir, overlay_name),
+                                     axis=args.axis, valve_plane_idx=final_idx)
+            del data
 
-        results.append({
-            "folder": folder_name, "frame_idx": frame_idx, "filename": filename,
-            "volume_ml_v1": v1_vol, "volume_ml_v2": v2_vol,
-            "voxel_count_v1": int(m1.sum()), "voxel_count_v2": int(m2.sum()),
-            "valve_plane_auto": auto_idx, "valve_plane_final": final_idx,
-        })
-
-        overlay_name = f"{folder_name}_frame_{frame_idx:02d}_overlay.png"
-        save_comparison_overlay(data, m1, m2, centroid, filename,
-                                 os.path.join(qc_dir, overlay_name),
-                                 axis=args.axis, valve_plane_idx=final_idx)
-
-    save_comparison_csv(results, os.path.join(args.output, "volumes_comparison.csv"))
-    save_comparison_plot(results, os.path.join(args.output, "volume_comparison_plot.png"))
+    save_comparison_csv(results, os.path.join(args.output, "volumes_comparison.csv"), methods)
+    save_comparison_plot(results, os.path.join(args.output, "volume_comparison_plot.png"), methods)
 
     # ── Summary ──────────────────────────────────────────────────────
-    diffs = np.array([r["volume_ml_v2"] - r["volume_ml_v1"] for r in results])
-    v1_all = np.array([r["volume_ml_v1"] for r in results])
-    v2_all = np.array([r["volume_ml_v2"] for r in results])
     print(f"\n{'=' * 60}\nSUMMARY\n{'=' * 60}")
     for r in results:
-        print(f"  {r['folder']}/frame_{r['frame_idx']:02d}: "
-              f"v1={r['volume_ml_v1']:.2f} mL  v2={r['volume_ml_v2']:.2f} mL  "
-              f"diff={r['volume_ml_v2'] - r['volume_ml_v1']:+.2f} mL")
-    print(f"\n  mean v1 volume:        {v1_all.mean():.2f} mL")
-    print(f"  mean v2 volume:        {v2_all.mean():.2f} mL")
-    print(f"  mean (v2-v1):          {diffs.mean():+.2f} mL")
-    print(f"  mean |v2-v1|:          {np.abs(diffs).mean():.2f} mL")
-    print(f"  max |v2-v1|:           {np.abs(diffs).max():.2f} mL")
-    if args.manual_review:
+        parts = [f"{m}={r[f'volume_ml_{m}']:.2f} mL" for m in methods]
+        if run_v1 and run_v2:
+            parts.append(f"diff={r['volume_ml_v2'] - r['volume_ml_v1']:+.2f} mL")
+        print(f"  phase {r['phase_pct']:4g}%  ({r['folder']}/frame_{r['frame_idx']:02d}): "
+              + "  ".join(parts))
+    print()
+    for m in methods:
+        vals = np.array([r[f"volume_ml_{m}"] for r in results])
+        print(f"  mean {m} volume:        {vals.mean():.2f} mL")
+    if run_v1 and run_v2:
+        diffs = np.array([r["volume_ml_v2"] - r["volume_ml_v1"] for r in results])
+        print(f"  mean (v2-v1):          {diffs.mean():+.2f} mL")
+        print(f"  mean |v2-v1|:          {np.abs(diffs).mean():.2f} mL")
+        print(f"  max |v2-v1|:           {np.abs(diffs).max():.2f} mL")
+    if args.manual_review and run_v2:
         n_corrected = sum(1 for r in results if r["valve_plane_final"] != r["valve_plane_auto"])
         print(f"  frames manually corrected: {n_corrected}/{len(results)}")
     print(f"\nAll outputs saved to: {args.output}/")
